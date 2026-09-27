@@ -26,6 +26,16 @@ import os
 
 from qgis.PyQt import uic
 from qgis.PyQt import QtWidgets
+from qgis.PyQt.QtWidgets import QFileDialog
+from qgis.core import (
+    QgsVectorLayer,
+    QgsProject,
+    QgsWkbTypes,
+    QgsFeature,
+    QgsGeometry
+)
+
+from .Survee_analysis_dialog import SurveeAnalysisDialog
 
 # This loads your .ui file so that PyQt can populate your plugin with the elements from Qt Designer
 FORM_CLASS, _ = uic.loadUiType(
@@ -44,3 +54,160 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
         # http://qt-project.org/doc/qt-4.8/designer-using-a-ui-file.html
         # #widgets-and-dialogs-with-auto-connect
         self.setupUi(self)
+
+        self.dxf_layer = None
+
+        self.btnSelectDxf.clicked.connect(self.select_dxf)
+        self.btnAnalyzeDxf.clicked.connect(self.analyze_dxf)
+
+    def select_dxf(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Selecionar ficheiro DXF",
+            "",
+            "DXF files (*.dxf)"
+        )
+
+        if file_path:
+            self.lblDxfPath.setText(file_path)
+
+            self.dxf_layer = QgsVectorLayer(
+                file_path,
+                "DXF",
+                "ogr"
+            )
+
+            if self.dxf_layer.isValid():
+                QgsProject.instance().addMapLayer(self.dxf_layer)
+
+    def analyze_dxf(self):
+
+        if self.dxf_layer is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Survee",
+                "Nenhum ficheiro DXF foi carregado."
+            )
+            return
+
+        total = 0
+        lines = 0
+        points = 0
+        polygons = 0
+
+        for feature in self.dxf_layer.getFeatures():
+
+            total += 1
+
+            geometry = feature.geometry()
+
+            if geometry.isEmpty():
+                continue
+
+            geometry_type = QgsWkbTypes.geometryType(
+                geometry.wkbType()
+            )
+
+            if geometry_type == QgsWkbTypes.LineGeometry:
+                lines += 1
+
+            elif geometry_type == QgsWkbTypes.PointGeometry:
+                points += 1
+
+            elif geometry_type == QgsWkbTypes.PolygonGeometry:
+                polygons += 1
+
+        dialog = SurveeAnalysisDialog(
+            self.dxf_layer,
+            total,
+            lines,
+            points,
+            polygons,
+            self
+        )
+
+        result = dialog.exec()
+
+        if result == QtWidgets.QDialog.Accepted:
+
+            selected_layers = dialog.selected_layers
+
+            print("Layers selecionadas:")
+            print(selected_layers)
+
+            self.create_selected_layer(
+                selected_layers
+            )
+
+        dialog.exec()
+
+    def create_selected_layer(self, selected_layers):
+
+        source_layer = self.dxf_layer
+
+        selected_features = []
+
+        # Procurar o campo que contém o nome da layer DXF
+        layer_field = None
+
+        for field in source_layer.fields():
+
+            field_name = field.name().lower()
+
+            if field_name in ["layer", "layername"]:
+                layer_field = field.name()
+                break
+
+        if layer_field is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Survee",
+                "Não foi possível identificar o campo da layer no DXF."
+            )
+            return None
+
+        # Percorrer todas as entidades
+        for feature in source_layer.getFeatures():
+
+            layer_name = feature[layer_field]
+
+            if layer_name in selected_layers:
+                selected_features.append(feature)
+
+        if not selected_features:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Survee",
+                "Não foram encontradas entidades nas layers selecionadas."
+            )
+            return None
+
+        # Criar camada temporária
+        selected_layer = QgsVectorLayer(
+            "LineString",
+            "Survee - Linhas selecionadas",
+            "memory"
+        )
+
+        # Copiar os campos da camada original
+        provider = selected_layer.dataProvider()
+
+        provider.addAttributes(
+            source_layer.fields()
+        )
+
+        selected_layer.updateFields()
+
+        # Adicionar as entidades
+        provider.addFeatures(
+            selected_features
+        )
+
+        selected_layer.updateExtents()
+
+        # Adicionar ao projeto
+        QgsProject.instance().addMapLayer(
+            selected_layer
+        )
+
+        return selected_layer
