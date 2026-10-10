@@ -23,16 +23,19 @@
 """
 
 import os
+import processing
 
 from qgis.PyQt import uic
 from qgis.PyQt import QtWidgets
 from qgis.PyQt.QtWidgets import QFileDialog
+from qgis.utils import iface
 from qgis.core import (
     QgsVectorLayer,
+    QgsRasterLayer,
     QgsProject,
     QgsWkbTypes,
     QgsFeature,
-    QgsGeometry
+    QgsFillSymbol
 )
 
 from .Survee_analysis_dialog import SurveeAnalysisDialog
@@ -56,6 +59,8 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
         self.setupUi(self)
 
         self.dxf_layer = None
+        self.selected_line_layer = None
+        self.polygon_layer = None
 
         self.btnSelectDxf.clicked.connect(self.select_dxf)
         self.btnAnalyzeDxf.clicked.connect(self.analyze_dxf)
@@ -68,17 +73,36 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
             "DXF files (*.dxf)"
         )
 
-        if file_path:
-            self.lblDxfPath.setText(file_path)
+        if not file_path:
+            return
 
-            self.dxf_layer = QgsVectorLayer(
-                file_path,
-                "DXF",
-                "ogr"
+        # Remover o DXF anterior do projeto, caso esteja adicionado
+        project = QgsProject.instance()
+
+        if self.dxf_layer is not None:
+            if project.mapLayer(self.dxf_layer.id()) is not None:
+                project.removeMapLayer(self.dxf_layer.id())
+
+        self.lblDxfPath.setText(file_path)
+
+        # Carregar o DXF apenas para processamento interno
+        self.dxf_layer = QgsVectorLayer(
+            file_path,
+            "DXF - Origem",
+            "ogr"
+        )
+
+        if not self.dxf_layer.isValid():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Survee",
+                "Não foi possível carregar o ficheiro DXF."
             )
+            self.dxf_layer = None
+            return
 
-            if self.dxf_layer.isValid():
-                QgsProject.instance().addMapLayer(self.dxf_layer)
+        # Não adicionar o DXF original ao projeto.
+        # Será utilizado apenas para análise e filtragem.
 
     def analyze_dxf(self):
 
@@ -128,16 +152,15 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
 
         result = dialog.exec()
 
-        if result == QtWidgets.QDialog.Accepted:
+        result = dialog.exec()
 
+        if result == QtWidgets.QDialog.Accepted:
             selected_layers = dialog.selected_layers
 
-            print("Layers selecionadas:")
-            print(selected_layers)
+            line_layer = self.create_selected_layer(selected_layers)
 
-            self.create_selected_layer(
-                selected_layers
-            )
+            if line_layer is not None:
+                self.create_polygons(line_layer)
 
         dialog.exec()
 
@@ -145,13 +168,18 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
 
         source_layer = self.dxf_layer
 
-        selected_features = []
+        if source_layer is None or not source_layer.isValid():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Survee",
+                "Não existe uma camada DXF válida."
+            )
+            return None
 
-        # Procurar o campo que contém o nome da layer DXF
+        # Procurar o campo que identifica a layer do DXF
         layer_field = None
 
         for field in source_layer.fields():
-
             field_name = field.name().lower()
 
             if field_name in ["layer", "layername"]:
@@ -162,52 +190,253 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Survee",
-                "Não foi possível identificar o campo da layer no DXF."
+                "Não foi possível identificar as layers do DXF."
             )
             return None
 
-        # Percorrer todas as entidades
+        # Criar uma camada temporária de linhas
+        selected_layer = QgsVectorLayer(
+            "MultiLineString",
+            "Survee - Linhas selecionadas",
+            "memory"
+        )
+
+        # Preservar o CRS da camada original
+        selected_layer.setCrs(source_layer.crs())
+
+        # Copiar os campos da camada original
+        provider = selected_layer.dataProvider()
+        provider.addAttributes(source_layer.fields())
+        selected_layer.updateFields()
+
+        selected_features = []
+        ignored_features = 0
+
+        # Filtrar as entidades das layers escolhidas
         for feature in source_layer.getFeatures():
 
-            layer_name = feature[layer_field]
+            layer_name = str(feature[layer_field])
 
-            if layer_name in selected_layers:
-                selected_features.append(feature)
+            if layer_name not in selected_layers:
+                continue
+
+            geometry = feature.geometry()
+
+            if geometry.isNull() or geometry.isEmpty():
+                ignored_features += 1
+                continue
+
+            # Aceitar apenas geometrias lineares
+            if QgsWkbTypes.geometryType(
+                geometry.wkbType()
+            ) != QgsWkbTypes.LineGeometry:
+                ignored_features += 1
+                continue
+
+            # Converter linhas simples em multilinhas
+            if not geometry.isMultipart():
+                geometry.convertToMultiType()
+
+            # Criar uma nova entidade com os atributos originais
+            new_feature = QgsFeature(selected_layer.fields())
+            new_feature.setAttributes(feature.attributes())
+            new_feature.setGeometry(geometry)
+
+            selected_features.append(new_feature)
 
         if not selected_features:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Survee",
-                "Não foram encontradas entidades nas layers selecionadas."
+                "Não foram encontradas entidades lineares "
+                "nas layers selecionadas."
             )
             return None
 
-        # Criar camada temporária
-        selected_layer = QgsVectorLayer(
-            "LineString",
-            "Survee - Linhas selecionadas",
-            "memory"
-        )
+        # Inserir as entidades na camada temporária
+        success, _ = provider.addFeatures(selected_features)
 
-        # Copiar os campos da camada original
-        provider = selected_layer.dataProvider()
-
-        provider.addAttributes(
-            source_layer.fields()
-        )
-
-        selected_layer.updateFields()
-
-        # Adicionar as entidades
-        provider.addFeatures(
-            selected_features
-        )
+        if not success:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Survee",
+                "Ocorreu um erro ao criar a camada de linhas."
+            )
+            return None
 
         selected_layer.updateExtents()
 
-        # Adicionar ao projeto
-        QgsProject.instance().addMapLayer(
-            selected_layer
+        # Remover a camada anterior, se existir
+        project = QgsProject.instance()
+
+        if self.selected_line_layer is not None:
+            project.removeMapLayer(
+                self.selected_line_layer.id()
+            )
+
+        # Adicionar a nova camada ao projeto
+        project.addMapLayer(selected_layer)
+
+        self.selected_line_layer = selected_layer
+
+        # Apresentar um resumo ao utilizador
+        QtWidgets.QMessageBox.information(
+            self,
+            "Survee",
+            f"Camada criada com sucesso.\n\n"
+            f"Entidades lineares: {len(selected_features)}\n"
+            f"Entidades ignoradas: {ignored_features}"
         )
 
         return selected_layer
+
+    
+    def create_polygons(self, line_layer):
+
+        if line_layer is None or not line_layer.isValid():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Survee",
+                "Não existe uma camada de linhas válida."
+            )
+            return None
+
+        try:
+            # Converter as linhas em polígonos
+            result = processing.run(
+                "native:polygonize",
+                {
+                    "INPUT": line_layer,
+                    "KEEP_FIELDS": False,
+                    "OUTPUT": "memory:"
+                }
+            )
+
+            polygon_layer = result["OUTPUT"]
+
+            # Verificar o resultado
+            if not isinstance(polygon_layer, QgsVectorLayer):
+                polygon_layer = QgsVectorLayer(
+                    polygon_layer,
+                    "Survee - Polígonos",
+                    "ogr"
+                )
+
+            if not polygon_layer.isValid():
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Survee",
+                    "Não foi possível criar a camada de polígonos."
+                )
+                return None
+
+            # Definir o nome da camada
+            polygon_layer.setName("Survee - Polígonos")
+
+            # Preservar o sistema de coordenadas
+            polygon_layer.setCrs(line_layer.crs())
+
+            # Definir um estilo visual para os polígonos
+            symbol = QgsFillSymbol.createSimple({
+                "color": "255,255,255,0",
+                "outline_color": "255,70,0,255",
+                "outline_width": "0.8",
+                "outline_width_unit": "MM"
+            })
+
+            polygon_layer.renderer().setSymbol(symbol)
+            polygon_layer.triggerRepaint()
+
+            # Remover a camada anterior, se existir
+            project = QgsProject.instance()
+
+            if hasattr(self, "polygon_layer"):
+                if self.polygon_layer is not None:
+                    if project.mapLayer(self.polygon_layer.id()):
+                        project.removeMapLayer(
+                            self.polygon_layer.id()
+                        )
+
+            # Adicionar a nova camada ao projeto
+            project.addMapLayer(polygon_layer)
+
+            self.polygon_layer = polygon_layer
+
+            # Centrar o mapa na área dos polígonos
+            if polygon_layer.featureCount() > 0:
+                extent = polygon_layer.extent()
+                extent.scale(1.15)
+
+                iface.mapCanvas().setExtent(extent)
+                iface.mapCanvas().refresh()
+
+            # Adicionar a imagem de satélite
+            self.add_satellite_layer()
+
+            # Contar os polígonos criados
+            polygon_count = polygon_layer.featureCount()
+
+            if polygon_count == 0:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Survee",
+                    "Não foram criados polígonos.\n\n"
+                    "Verifica se as linhas formam limites fechados."
+                )
+            else:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Survee",
+                    f"Polígonos criados com sucesso!\n\n"
+                    f"Número de polígonos: {polygon_count}"
+                )
+
+            return polygon_layer
+
+        except Exception as error:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Survee",
+                f"Ocorreu um erro ao criar os polígonos:\n\n{error}"
+            )
+            return None
+    
+    def add_satellite_layer(self):
+
+        project = QgsProject.instance()
+        layer_name = "Survee - Imagem de satélite"
+
+        # Verificar se a camada já existe
+        for layer in project.mapLayers().values():
+            if layer.name() == layer_name:
+                return layer
+
+        # Criar a ligação ao serviço de imagens
+        uri = (
+            "type=xyz&url="
+            "https://server.arcgisonline.com/ArcGIS/rest/services/"
+            "World_Imagery/MapServer/tile/{z}/{y}/{x}"
+        )
+
+        satellite_layer = QgsRasterLayer(
+            uri,
+            layer_name,
+            "wms"
+        )
+
+        if not satellite_layer.isValid():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Survee",
+                "Não foi possível carregar a imagem de satélite.\n\n"
+                "Verifica a ligação à Internet."
+            )
+            return None
+
+        # Adicionar a camada ao fundo do painel de camadas
+        project.addMapLayer(satellite_layer, False)
+
+        root = project.layerTreeRoot()
+        root.insertLayer(len(root.children()), satellite_layer)
+
+        return satellite_layer
