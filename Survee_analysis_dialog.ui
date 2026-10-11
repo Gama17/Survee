@@ -6,7 +6,7 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>411</width>
+    <width>444</width>
     <height>421</height>
    </rect>
   </property>
@@ -125,6 +125,32 @@
    </property>
    <property name="text">
     <string>Continuar</string>
+   </property>
+  </widget>
+  <widget class="QPushButton" name="btnSelectAll">
+   <property name="geometry">
+    <rect>
+     <x>300</x>
+     <y>240</y>
+     <width>131</width>
+     <height>28</height>
+    </rect>
+   </property>
+   <property name="text">
+    <string>Selecionar tudo</string>
+   </property>
+  </widget>
+  <widget class="QPushButton" name="btnDeselectAll">
+   <property name="geometry">
+    <rect>
+     <x>300</x>
+     <y>270</y>
+     <width>131</width>
+     <height>28</height>
+    </rect>
+   </property>
+   <property name="text">
+    <string>Desselecionar tudo</string>
    </property>
   </widget>
  </widget>

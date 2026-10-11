@@ -24,6 +24,7 @@
 
 import os
 import processing
+import urllib.parse
 
 from qgis.PyQt import uic
 from qgis.PyQt import QtWidgets
@@ -35,8 +36,13 @@ from qgis.core import (
     QgsProject,
     QgsWkbTypes,
     QgsFeature,
-    QgsFillSymbol
+    QgsFillSymbol,
+    QgsLayerTreeLayer,
+    QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
+    QgsVectorFileWriter
 )
+from qgis.gui import QgsProjectionSelectionWidget
 
 from .Survee_analysis_dialog import SurveeAnalysisDialog
 
@@ -60,7 +66,20 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self.dxf_layer = None
         self.selected_line_layer = None
+        self.selected_line_layer_id = None
         self.polygon_layer = None
+
+        # --- Criar e injetar o seletor de CRS no contentor do Qt Designer ---
+        self.mCrsSelector = QgsProjectionSelectionWidget(self)
+        self.mCrsSelector.setCrs(QgsCoordinateReferenceSystem("EPSG:3763")) # Padrão EPSG:3763
+
+        # Inserir o seletor no container criado no Qt Designer
+        if hasattr(self, 'crsContainer'):
+            layout = self.crsContainer.layout()
+            if layout is None:
+                layout = QtWidgets.QVBoxLayout(self.crsContainer)
+                self.crsContainer.setLayout(layout)
+            layout.addWidget(self.mCrsSelector)
 
         self.btnSelectDxf.clicked.connect(self.select_dxf)
         self.btnAnalyzeDxf.clicked.connect(self.analyze_dxf)
@@ -68,13 +87,16 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
     def select_dxf(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Selecionar ficheiro DXF",
+            "Selecionar ficheiro DXF / DWG",
             "",
-            "DXF files (*.dxf)"
+            "Ficheiros CAD (*.dxf *.dwg);;DXF files (*.dxf);;DWG files (*.dwg)"
         )
 
         if not file_path:
             return
+
+        # Obter o CRS selecionado pelo utilizador
+        chosen_crs = self.mCrsSelector.crs()
 
         # Remover o DXF anterior do projeto, caso esteja adicionado
         project = QgsProject.instance()
@@ -85,10 +107,10 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self.lblDxfPath.setText(file_path)
 
-        # Carregar o DXF apenas para processamento interno
+        # Carregar o ficheiro (o OGR do QGIS suporta DXF e alguns DWG)
         self.dxf_layer = QgsVectorLayer(
             file_path,
-            "DXF - Origem",
+            "CAD - Origem",
             "ogr"
         )
 
@@ -96,10 +118,15 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Survee",
-                "Não foi possível carregar o ficheiro DXF."
+                "Não foi possível carregar o ficheiro CAD (.dxf / .dwg).\n\n"
+                "Nota: Para alguns ficheiros .dwg, o QGIS pode necessitar "
+                "de ferramentas externas de conversão (como o ODA File Converter)."
             )
             self.dxf_layer = None
             return
+
+        if chosen_crs.isValid():
+            self.dxf_layer.setCrs(chosen_crs)
 
         # Não adicionar o DXF original ao projeto.
         # Será utilizado apenas para análise e filtragem.
@@ -120,9 +147,7 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
         polygons = 0
 
         for feature in self.dxf_layer.getFeatures():
-
             total += 1
-
             geometry = feature.geometry()
 
             if geometry.isEmpty():
@@ -134,10 +159,8 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
 
             if geometry_type == QgsWkbTypes.LineGeometry:
                 lines += 1
-
             elif geometry_type == QgsWkbTypes.PointGeometry:
                 points += 1
-
             elif geometry_type == QgsWkbTypes.PolygonGeometry:
                 polygons += 1
 
@@ -152,17 +175,12 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
 
         result = dialog.exec()
 
-        result = dialog.exec()
-
         if result == QtWidgets.QDialog.Accepted:
             selected_layers = dialog.selected_layers
-
             line_layer = self.create_selected_layer(selected_layers)
 
             if line_layer is not None:
                 self.create_polygons(line_layer)
-
-        dialog.exec()
 
     def create_selected_layer(self, selected_layers):
 
@@ -266,18 +284,27 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
 
         selected_layer.updateExtents()
 
-        # Remover a camada anterior, se existir
+        # Remover a camada anterior, caso ainda exista no projeto
         project = QgsProject.instance()
 
-        if self.selected_line_layer is not None:
-            project.removeMapLayer(
-                self.selected_line_layer.id()
+        if self.selected_line_layer_id is not None:
+            old_layer = project.mapLayer(
+                self.selected_line_layer_id
             )
+
+            if old_layer is not None:
+                project.removeMapLayer(
+                    self.selected_line_layer_id
+                )
+
+            self.selected_line_layer_id = None
+            self.selected_line_layer = None
 
         # Adicionar a nova camada ao projeto
         project.addMapLayer(selected_layer)
 
         self.selected_line_layer = selected_layer
+        self.selected_line_layer_id = selected_layer.id()
 
         # Apresentar um resumo ao utilizador
         QtWidgets.QMessageBox.information(
@@ -383,13 +410,27 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
                     "Não foram criados polígonos.\n\n"
                     "Verifica se as linhas formam limites fechados."
                 )
-            else:
-                QtWidgets.QMessageBox.information(
-                    self,
-                    "Survee",
-                    f"Polígonos criados com sucesso!\n\n"
-                    f"Número de polígonos: {polygon_count}"
-                )
+                return None
+
+            # --- FECHAR A JANELA DO PLUGIN ANTES DE PERGUNTAR ---
+            # Isto liberta o QGIS e permite ver perfeitamente o mapa e a imagem de satélite
+            self.close()
+
+            # --- PERGUNTAR SE DESEJA AVANÇAR PARA KML ---
+            # O utilizador fica com o mapa livre para verificar e decide se avança
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "Survee",
+                f"Polígonos criados com sucesso! (Total: {polygon_count})\n\n"
+                "Pode agora verificar o mapa e confirmar se os limites estão corretos.\n"
+                "Deseja prosseguir para a exportação em formato KML?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.Yes
+            )
+
+            if reply == QtWidgets.QMessageBox.Yes:
+                # Função onde vais tratar da exportação para KML
+                self.export_to_kml(polygon_layer)
 
             return polygon_layer
 
@@ -402,7 +443,6 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
             return None
     
     def add_satellite_layer(self):
-
         project = QgsProject.instance()
         layer_name = "Survee - Imagem de satélite"
 
@@ -411,11 +451,13 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
             if layer.name() == layer_name:
                 return layer
 
-        # Criar a ligação ao serviço de imagens
+        # URI estruturado especificamente para o fornecedor XYZ do QGIS
+        # O parâmetro zmax e zmin garantem que os tiles aparecem em qualquer nível de zoom
         uri = (
             "type=xyz&url="
             "https://server.arcgisonline.com/ArcGIS/rest/services/"
-            "World_Imagery/MapServer/tile/{z}/{y}/{x}"
+            "World_Imagery/MapServer/tile/%7Bz%7D/%7By%7D/%7Bx%7D"
+            "&zmax=19&zmin=0"
         )
 
         satellite_layer = QgsRasterLayer(
@@ -425,18 +467,87 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
         )
 
         if not satellite_layer.isValid():
+            # Tentar um URL alternativo (ex: OpenStreetMap ou Esri direto) se o primeiro falhar
+            uri_alt = (
+                "type=xyz&url="
+                "https://mt1.google.com/vt/lyrs=s&x=%7Bx%7D&y=%7By%7D&z=%7Bz%7D"
+                "&zmax=20&zmin=0"
+            )
+            satellite_layer = QgsRasterLayer(uri_alt, layer_name, "wms")
+
+        if not satellite_layer.isValid():
             QtWidgets.QMessageBox.warning(
                 self,
                 "Survee",
                 "Não foi possível carregar a imagem de satélite.\n\n"
-                "Verifica a ligação à Internet."
+                "Verifica a tua ligação à Internet."
             )
             return None
 
-        # Adicionar a camada ao fundo do painel de camadas
+        # Adicionar a camada ao projeto (sem sinalizar logo no painel para controlarmos a posição)
         project.addMapLayer(satellite_layer, False)
 
+        # Inserir no fundo da árvore de camadas (Layer Tree)
         root = project.layerTreeRoot()
-        root.insertLayer(len(root.children()), satellite_layer)
+        root.insertChildNode(len(root.children()), QgsLayerTreeLayer(satellite_layer))
 
         return satellite_layer
+
+    def export_to_kml(self, polygon_layer):
+        # 1. Pedir ao utilizador o local e nome para guardar o ficheiro KML
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Guardar Ficheiro KML",
+            "",
+            "KML files (*.kml)"
+        )
+
+        if not file_path:
+            return
+
+        if not file_path.lower().endswith(".kml"):
+            file_path += ".kml"
+
+        try:
+            # 2. Configuração moderna usando writeAsVectorFormatV3
+            options = QgsVectorFileWriter.SaveVectorOptions()
+            options.driverName = "KML"
+            options.fileEncoding = "UTF-8"
+            
+            # Reprojetar para WGS84 (EPSG:4326), obrigatório para KML/Google Earth
+            target_crs = QgsCoordinateReferenceSystem("EPSG:4326")
+            options.ct = QgsCoordinateTransform(
+                polygon_layer.crs(),
+                target_crs,
+                QgsProject.instance()
+            )
+
+            transform_context = QgsProject.instance().transformContext()
+
+            # Chamada correta da API atualizada do QGIS
+            error, error_string, _, _ = QgsVectorFileWriter.writeAsVectorFormatV3(
+                polygon_layer,
+                file_path,
+                transform_context,
+                options
+            )
+
+            if error == QgsVectorFileWriter.NoError:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Survee",
+                    f"Ficheiro KML exportado com sucesso para:\n{file_path}"
+                )
+            else:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Survee",
+                    f"Ocorreu um erro ao exportar o ficheiro KML:\n{error_string}"
+                )
+
+        except Exception as error:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Survee",
+                f"Erro crítico na exportação:\n\n{error}"
+            )

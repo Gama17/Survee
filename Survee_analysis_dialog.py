@@ -74,6 +74,9 @@ class SurveeAnalysisDialog(QtWidgets.QDialog, FORM_CLASS):
         self.btnCancel.clicked.connect(self.reject)
         self.btnContinue.clicked.connect(self.continue_analysis)
 
+        self.btnSelectAll.clicked.connect(self.select_all_layers)
+        self.btnDeselectAll.clicked.connect(self.deselect_all_layers)
+
     def populate_layers(self):
 
         layer_field = None
@@ -107,9 +110,7 @@ class SurveeAnalysisDialog(QtWidgets.QDialog, FORM_CLASS):
                 | QtCore.Qt.ItemIsUserCheckable
             )
 
-            item.setCheckState(
-                QtCore.Qt.Checked
-            )
+            item.setCheckState(QtCore.Qt.Unchecked)
 
             self.lstLayers.addItem(item)
 
@@ -139,3 +140,13 @@ class SurveeAnalysisDialog(QtWidgets.QDialog, FORM_CLASS):
             return
 
         self.accept()
+
+    def select_all_layers(self):
+        for index in range(self.lstLayers.count()):
+            item = self.lstLayers.item(index)
+            item.setCheckState(QtCore.Qt.Checked)
+
+    def deselect_all_layers(self):
+        for index in range(self.lstLayers.count()):
+            item = self.lstLayers.item(index)
+            item.setCheckState(QtCore.Qt.Unchecked)
