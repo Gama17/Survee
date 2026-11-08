@@ -44,7 +44,8 @@ from qgis.core import (
     QgsPalLayerSettings,
     QgsTextFormat,
     QgsTextBufferSettings,
-    QgsVectorLayerSimpleLabeling
+    QgsVectorLayerSimpleLabeling,
+    Qgis
 )
 from qgis.gui import QgsProjectionSelectionWidget
 from qgis.PyQt.QtGui import QFont, QColor
@@ -427,7 +428,7 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
                 settings = QgsPalLayerSettings()
                 settings.fieldName = "CASE WHEN $area >= 10000 THEN round($area / 10000, 2) || ' ha' ELSE round($area, 1) || ' m²' END"
                 settings.isExpression = True
-                settings.placement = QgsPalLayerSettings.OverPoint
+                settings.placement = Qgis.LabelPlacement.Horizontal
                 
                 text_format = QgsTextFormat()
                 text_format.setFont(QFont("Arial", 10, QFont.Bold))
@@ -532,61 +533,86 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
 
         return satellite_layer
 
-    def export_to_kml(self, polygon_layer):
-        # 1. Pedir ao utilizador o local e nome para guardar o ficheiro KML
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Guardar Ficheiro KML",
-            "",
-            "KML files (*.kml)"
-        )
+    def export_to_kml(self, original_polygon_layer):
+        project = QgsProject.instance()
+        exported_count = 0
+        error_count = 0
 
-        if not file_path:
-            return
+        # Procurar todas as camadas ativas de polígonos geradas (as que contêm "Polígono" no nome)
+        layers = [layer for layer in project.mapLayers().values() if "Polígono -" in layer.name()]
 
-        if not file_path.lower().endswith(".kml"):
-            file_path += ".kml"
-
-        try:
-            # 2. Configuração moderna usando writeAsVectorFormatV3
-            options = QgsVectorFileWriter.SaveVectorOptions()
-            options.driverName = "KML"
-            options.fileEncoding = "UTF-8"
-            
-            # Reprojetar para WGS84 (EPSG:4326), obrigatório para KML/Google Earth
-            target_crs = QgsCoordinateReferenceSystem("EPSG:4326")
-            options.ct = QgsCoordinateTransform(
-                polygon_layer.crs(),
-                target_crs,
-                QgsProject.instance()
-            )
-
-            transform_context = QgsProject.instance().transformContext()
-
-            # Chamada correta da API atualizada do QGIS
-            error, error_string, _, _ = QgsVectorFileWriter.writeAsVectorFormatV3(
-                polygon_layer,
-                file_path,
-                transform_context,
-                options
-            )
-
-            if error == QgsVectorFileWriter.NoError:
-                QtWidgets.QMessageBox.information(
-                    self,
-                    "Survee",
-                    f"Ficheiro KML exportado com sucesso para:\n{file_path}"
-                )
-            else:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "Survee",
-                    f"Ocorreu um erro ao exportar o ficheiro KML:\n{error_string}"
-                )
-
-        except Exception as error:
-            QtWidgets.QMessageBox.critical(
+        if not layers:
+            QtWidgets.QMessageBox.warning(
                 self,
                 "Survee",
-                f"Erro crítico na exportação:\n\n{error}"
+                "Nenhuma camada individual de polígonos foi encontrada para exportação."
+            )
+            return
+
+        # Iterar sobre cada camada de polígono individual encontrada
+        for layer in layers:
+            default_name = f"{layer.name()}.kml"
+
+            # 1. Pedir ao utilizador o local para guardar este ficheiro KML específico
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                f"Guardar Ficheiro KML para {layer.name()}",
+                default_name,  # O nome da camada aparece aqui
+                "KML files (*.kml)"
+            )
+
+            if not file_path:
+                continue # Se cancelar, passa para a próxima camada
+
+            # Garantir que o nome termina em .kml
+            if not file_path.lower().endswith(".kml"):
+                file_path += ".kml"
+
+            try:
+                # 2. Configuração moderna usando writeAsVectorFormatV3
+                options = QgsVectorFileWriter.SaveVectorOptions()
+                options.driverName = "KML"
+                options.fileEncoding = "UTF-8"
+                
+                # Reprojetar para WGS84 (EPSG:4326), obrigatório para KML/Google Earth
+                target_crs = QgsCoordinateReferenceSystem("EPSG:4326")
+                options.ct = QgsCoordinateTransform(
+                    layer.crs(),
+                    target_crs,
+                    QgsProject.instance()
+                )
+
+                transform_context = QgsProject.instance().transformContext()
+
+                # Escrever ficheiro KML
+                error, error_string, _, _ = QgsVectorFileWriter.writeAsVectorFormatV3(
+                    layer,
+                    file_path,
+                    transform_context,
+                    options
+                )
+
+                if error == QgsVectorFileWriter.NoError:
+                    exported_count += 1
+                else:
+                    error_count += 1
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Survee",
+                        f"Ocorreu um erro ao exportar {layer.name()}:\n{error_string}"
+                    )
+
+            except Exception as error:
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Survee",
+                    f"Erro crítico na exportação de {layer.name()}:\n\n{error}"
+                )
+
+        # Resumo final da exportação
+        if exported_count > 0:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Survee",
+                f"Exportação concluída!\n\nForam exportados {exported_count} ficheiros KML com sucesso."
             )
