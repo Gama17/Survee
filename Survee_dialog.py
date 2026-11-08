@@ -40,9 +40,14 @@ from qgis.core import (
     QgsLayerTreeLayer,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
-    QgsVectorFileWriter
+    QgsVectorFileWriter,
+    QgsPalLayerSettings,
+    QgsTextFormat,
+    QgsTextBufferSettings,
+    QgsVectorLayerSimpleLabeling
 )
 from qgis.gui import QgsProjectionSelectionWidget
+from qgis.PyQt.QtGui import QFont, QColor
 
 from .Survee_analysis_dialog import SurveeAnalysisDialog
 
@@ -85,9 +90,9 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
         self.btnAnalyzeDxf.clicked.connect(self.analyze_dxf)
 
     def select_dxf(self):
-        file_path, _ = QFileDialog.getOpenFileName(
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
-            "Selecionar ficheiro DXF / DWG",
+            "Selecionar ficheiro CAD",
             "",
             "Ficheiros CAD (*.dxf *.dwg);;DXF files (*.dxf);;DWG files (*.dwg)"
         )
@@ -95,19 +100,23 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
         if not file_path:
             return
 
-        # Obter o CRS selecionado pelo utilizador
         chosen_crs = self.mCrsSelector.crs()
-
-        # Remover o DXF anterior do projeto, caso esteja adicionado
         project = QgsProject.instance()
 
+        # --- SEGURANÇA CONTRA O ERRO DE OBJETO APAGADO ---
         if self.dxf_layer is not None:
-            if project.mapLayer(self.dxf_layer.id()) is not None:
-                project.removeMapLayer(self.dxf_layer.id())
+            try:
+                # Tenta verificar se o ID ainda existe no projeto para evitar o erro C++
+                if self.dxf_layer.id() in project.mapLayers():
+                    project.removeMapLayer(self.dxf_layer.id())
+            except RuntimeError:
+                # Se o objeto já foi apagado à mão pelo utilizador, a exceção é apanhada aqui
+                pass
+            self.dxf_layer = None
 
         self.lblDxfPath.setText(file_path)
 
-        # Carregar o ficheiro (o OGR do QGIS suporta DXF e alguns DWG)
+        # Carregar o novo ficheiro CAD
         self.dxf_layer = QgsVectorLayer(
             file_path,
             "CAD - Origem",
@@ -118,9 +127,7 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Survee",
-                "Não foi possível carregar o ficheiro CAD (.dxf / .dwg).\n\n"
-                "Nota: Para alguns ficheiros .dwg, o QGIS pode necessitar "
-                "de ferramentas externas de conversão (como o ODA File Converter)."
+                "Não foi possível carregar o ficheiro CAD (.dxf / .dwg)."
             )
             self.dxf_layer = None
             return
@@ -329,11 +336,26 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
             return None
 
         try:
-            # Converter as linhas em polígonos
+            # --- NOVO: Fechar pequenas aberturas nas linhas (Snapping) ---
+            # Tolerância de 0.5 metros (podes ajustar este valor se os buracos do CAD forem maiores)
+            snapped_result = processing.run(
+                "native:snapgeometries",
+                {
+                    "INPUT": line_layer,
+                    "REFERENCE_LAYER": line_layer,
+                    "TOLERANCE": 0.5, 
+                    "BEHAVIOR": 1, # Atrai para os vértices mais próximos
+                    "OUTPUT": "memory:"
+                }
+            )
+            
+            snapped_lines = snapped_result["OUTPUT"]
+
+            # Converter as linhas em polígonos usando as linhas já fechadas
             result = processing.run(
                 "native:polygonize",
                 {
-                    "INPUT": line_layer,
+                    "INPUT": snapped_lines, # Usa a camada corrigida em vez da original
                     "KEEP_FIELDS": False,
                     "OUTPUT": "memory:"
                 }
@@ -341,7 +363,6 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
 
             polygon_layer = result["OUTPUT"]
 
-            # Verificar o resultado
             if not isinstance(polygon_layer, QgsVectorLayer):
                 polygon_layer = QgsVectorLayer(
                     polygon_layer,
@@ -356,51 +377,7 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
                     "Não foi possível criar a camada de polígonos."
                 )
                 return None
-
-            # Definir o nome da camada
-            polygon_layer.setName("Survee - Polígonos")
-
-            # Preservar o sistema de coordenadas
-            polygon_layer.setCrs(line_layer.crs())
-
-            # Definir um estilo visual para os polígonos
-            symbol = QgsFillSymbol.createSimple({
-                "color": "255,255,255,0",
-                "outline_color": "255,70,0,255",
-                "outline_width": "0.8",
-                "outline_width_unit": "MM"
-            })
-
-            polygon_layer.renderer().setSymbol(symbol)
-            polygon_layer.triggerRepaint()
-
-            # Remover a camada anterior, se existir
-            project = QgsProject.instance()
-
-            if hasattr(self, "polygon_layer"):
-                if self.polygon_layer is not None:
-                    if project.mapLayer(self.polygon_layer.id()):
-                        project.removeMapLayer(
-                            self.polygon_layer.id()
-                        )
-
-            # Adicionar a nova camada ao projeto
-            project.addMapLayer(polygon_layer)
-
-            self.polygon_layer = polygon_layer
-
-            # Centrar o mapa na área dos polígonos
-            if polygon_layer.featureCount() > 0:
-                extent = polygon_layer.extent()
-                extent.scale(1.15)
-
-                iface.mapCanvas().setExtent(extent)
-                iface.mapCanvas().refresh()
-
-            # Adicionar a imagem de satélite
-            self.add_satellite_layer()
-
-            # Contar os polígonos criados
+                
             polygon_count = polygon_layer.featureCount()
 
             if polygon_count == 0:
@@ -408,28 +385,88 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
                     self,
                     "Survee",
                     "Não foram criados polígonos.\n\n"
-                    "Verifica se as linhas formam limites fechados."
+                    "Verifica se as linhas formam limites fechados ou aumenta a tolerância de fecho."
                 )
                 return None
 
-            # --- FECHAR A JANELA DO PLUGIN ANTES DE PERGUNTAR ---
-            # Isto liberta o QGIS e permite ver perfeitamente o mapa e a imagem de satélite
+            project = QgsProject.instance()
+            crs_auth_id = polygon_layer.crs().authid()
+            
+            symbol = QgsFillSymbol.createSimple({
+                "color": "255,255,255,0",
+                "outline_color": "255,70,0,255",
+                "outline_width": "0.8",
+                "outline_width_unit": "MM"
+            })
+
+            for feature in polygon_layer.getFeatures():
+                geometry = feature.geometry()
+                
+                if geometry.isEmpty():
+                    continue
+                    
+                area_m2 = geometry.area()
+                
+                if area_m2 >= 10000:
+                    area_ha = area_m2 / 10000.0
+                    layer_name = f"Polígono - {area_ha:.2f} ha"
+                else:
+                    layer_name = f"Polígono - {area_m2:.1f} m²"
+
+                single_polygon_layer = QgsVectorLayer(f"Polygon?crs={crs_auth_id}", layer_name, "memory")
+                single_polygon_layer.renderer().setSymbol(symbol.clone())
+                
+                dataProvider = single_polygon_layer.dataProvider()
+                dataProvider.addAttributes(polygon_layer.fields())
+                single_polygon_layer.updateFields()
+                
+                dataProvider.addFeature(feature)
+                single_polygon_layer.updateExtents()
+
+                # Configurar a etiqueta visual (Label)
+                settings = QgsPalLayerSettings()
+                settings.fieldName = "CASE WHEN $area >= 10000 THEN round($area / 10000, 2) || ' ha' ELSE round($area, 1) || ' m²' END"
+                settings.isExpression = True
+                settings.placement = QgsPalLayerSettings.OverPoint
+                
+                text_format = QgsTextFormat()
+                text_format.setFont(QFont("Arial", 10, QFont.Bold))
+                text_format.setColor(QColor("black"))
+                
+                buffer_settings = QgsTextBufferSettings()
+                buffer_settings.setEnabled(True)
+                buffer_settings.setSize(1.0)
+                buffer_settings.setColor(QColor("white"))
+                text_format.setBuffer(buffer_settings)
+                
+                settings.setFormat(text_format)
+                
+                labeling = QgsVectorLayerSimpleLabeling(settings)
+                single_polygon_layer.setLabelsEnabled(True)
+                single_polygon_layer.setLabeling(labeling)
+
+                single_polygon_layer.triggerRepaint()
+                project.addMapLayer(single_polygon_layer)
+
+            extent = polygon_layer.extent()
+            extent.scale(1.15)
+            iface.mapCanvas().setExtent(extent)
+            iface.mapCanvas().refresh()
+
+            self.add_satellite_layer()
             self.close()
 
-            # --- PERGUNTAR SE DESEJA AVANÇAR PARA KML ---
-            # O utilizador fica com o mapa livre para verificar e decide se avança
             reply = QtWidgets.QMessageBox.question(
-                self,
+                None,
                 "Survee",
-                f"Polígonos criados com sucesso! (Total: {polygon_count})\n\n"
-                "Pode agora verificar o mapa e confirmar se os limites estão corretos.\n"
-                "Deseja prosseguir para a exportação em formato KML?",
+                f"Foram criadas {polygon_count} camadas individuais.\n\n"
+                "Verifique os limites e os rótulos de área no mapa.\n"
+                "Deseja prosseguir para a exportação KML?",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
                 QtWidgets.QMessageBox.Yes
             )
 
             if reply == QtWidgets.QMessageBox.Yes:
-                # Função onde vais tratar da exportação para KML
                 self.export_to_kml(polygon_layer)
 
             return polygon_layer
@@ -446,13 +483,23 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
         project = QgsProject.instance()
         layer_name = "Survee - Imagem de satélite"
 
-        # Verificar se a camada já existe
+        # Verificar se a camada realmente existe e é válida no projeto atual
+        existing_layer = None
         for layer in project.mapLayers().values():
             if layer.name() == layer_name:
-                return layer
+                try:
+                    # Testa se o objeto C++ está vivo
+                    if layer.isValid():
+                        existing_layer = layer
+                        break
+                except RuntimeError:
+                    # Objeto C++ foi apagado, ignorar referência morta
+                    continue
 
-        # URI estruturado especificamente para o fornecedor XYZ do QGIS
-        # O parâmetro zmax e zmin garantem que os tiles aparecem em qualquer nível de zoom
+        if existing_layer is not None:
+            return existing_layer
+
+        # Se não existe (ou foi apagada), criamos de novo:
         uri = (
             "type=xyz&url="
             "https://server.arcgisonline.com/ArcGIS/rest/services/"
@@ -460,14 +507,9 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
             "&zmax=19&zmin=0"
         )
 
-        satellite_layer = QgsRasterLayer(
-            uri,
-            layer_name,
-            "wms"
-        )
+        satellite_layer = QgsRasterLayer(uri, layer_name, "wms")
 
         if not satellite_layer.isValid():
-            # Tentar um URL alternativo (ex: OpenStreetMap ou Esri direto) se o primeiro falhar
             uri_alt = (
                 "type=xyz&url="
                 "https://mt1.google.com/vt/lyrs=s&x=%7Bx%7D&y=%7By%7D&z=%7Bz%7D"
@@ -479,17 +521,14 @@ class SurveeDialog(QtWidgets.QDialog, FORM_CLASS):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Survee",
-                "Não foi possível carregar a imagem de satélite.\n\n"
-                "Verifica a tua ligação à Internet."
+                "Não foi possível carregar a imagem de satélite."
             )
             return None
 
-        # Adicionar a camada ao projeto (sem sinalizar logo no painel para controlarmos a posição)
+        # Adicionar ao projeto e colocar no fundo
         project.addMapLayer(satellite_layer, False)
-
-        # Inserir no fundo da árvore de camadas (Layer Tree)
         root = project.layerTreeRoot()
-        root.insertChildNode(len(root.children()), QgsLayerTreeLayer(satellite_layer))
+        root.insertLayer(len(root.children()), satellite_layer)
 
         return satellite_layer
 
